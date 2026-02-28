@@ -5,6 +5,15 @@
 
   "duckmail_api_base": "https://api.duckmail.sbs",
   "duckmail_bearer": "",
+  "imap_host": "",
+  "imap_port": 993,
+  "imap_user": "",
+  "imap_pass": "",
+  "imap_folder": "INBOX",
+  "imap_ssl": true,
+  "email_domain": "",
+  "email_prefix": "auto",
+  "fixed_email": "",
 
   "proxy": "",
 
