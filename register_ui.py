@@ -41,6 +41,7 @@ QUERY_PARAM_RE = re.compile(
 JSON_SENSITIVE_VALUE_RE = re.compile(
     r'(?i)("(?:csrfToken|state|code|device_id|auth_session_logging_id|login_hint|access_token|id_token|refresh_token)"\s*:\s*")([^"]+)(")'
 )
+STATS_LINE_RE = re.compile(r"^\[STATS\]\s*([a-z_]+)\s*=\s*(-?\d+)\s*$", re.IGNORECASE)
 
 
 def mask_text(value: str, head: int = 2, tail: int = 2) -> str:
@@ -74,6 +75,68 @@ def redact_text(value: str) -> str:
     return text
 
 
+def resolve_project_path(path_value: str) -> Path:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return PROJECT_DIR
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    return PROJECT_DIR / p
+
+
+def count_nonempty_lines(path: Path) -> int:
+    if not path.exists() or not path.is_file():
+        return 0
+    count = 0
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+    except Exception:
+        return 0
+    return count
+
+
+def count_accounts_in_output(output_file: str):
+    path = resolve_project_path(output_file)
+    if not path.exists() or not path.is_file():
+        return 0, 0
+    total = 0
+    unique = set()
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                total += 1
+                email = line.split("----", 1)[0].strip().lower()
+                if email and "@" in email:
+                    unique.add(email)
+    except Exception:
+        return 0, 0
+    return total, len(unique)
+
+
+def collect_local_pool_stats(output_file: str):
+    pool_total, pool_unique = count_accounts_in_output(output_file)
+    token_dir = resolve_project_path("codex_tokens")
+    token_json_total = 0
+    if token_dir.exists() and token_dir.is_dir():
+        token_json_total = sum(1 for p in token_dir.iterdir() if p.is_file() and p.suffix.lower() == ".json")
+    ak_total = count_nonempty_lines(resolve_project_path("ak.txt"))
+    rk_total = count_nonempty_lines(resolve_project_path("rk.txt"))
+    return {
+        "pool_total": pool_total,
+        "pool_unique": pool_unique,
+        "token_json_total": token_json_total,
+        "ak_total": ak_total,
+        "rk_total": rk_total,
+    }
+
+
 def build_runner_code(module_name: str, total_accounts: int, output_file: str, workers: int, proxy: str) -> str:
     proxy_expr = "None" if not proxy.strip() else repr(proxy.strip())
     return (
@@ -90,6 +153,7 @@ class RegisterUI(QMainWindow):
         super().__init__()
         self.process = QProcess(self)
         self._loaded_config = {}
+        self._stats = {}
         self._setup_process()
         self._setup_ui()
         self.load_config()
@@ -141,6 +205,30 @@ class RegisterUI(QMainWindow):
         form.addWidget(QLabel("Proxy Override"), 3, 0)
         form.addWidget(self.proxy_edit, 3, 1, 1, 3)
 
+        stats_box = QGroupBox("Stats")
+        stats_grid = QGridLayout(stats_box)
+        self.pool_total_label = QLabel("-")
+        self.pool_unique_label = QLabel("-")
+        self.run_success_label = QLabel("0")
+        self.run_fail_label = QLabel("0")
+        self.token_json_label = QLabel("-")
+        self.ak_rk_label = QLabel("-")
+        self.btn_refresh_stats = QPushButton("Refresh Stats")
+
+        stats_grid.addWidget(QLabel("Pool Total"), 0, 0)
+        stats_grid.addWidget(self.pool_total_label, 0, 1)
+        stats_grid.addWidget(QLabel("Pool Unique"), 0, 2)
+        stats_grid.addWidget(self.pool_unique_label, 0, 3)
+        stats_grid.addWidget(QLabel("Run Success"), 1, 0)
+        stats_grid.addWidget(self.run_success_label, 1, 1)
+        stats_grid.addWidget(QLabel("Run Fail"), 1, 2)
+        stats_grid.addWidget(self.run_fail_label, 1, 3)
+        stats_grid.addWidget(QLabel("Token JSON"), 2, 0)
+        stats_grid.addWidget(self.token_json_label, 2, 1)
+        stats_grid.addWidget(QLabel("AK / RK"), 2, 2)
+        stats_grid.addWidget(self.ak_rk_label, 2, 3)
+        stats_grid.addWidget(self.btn_refresh_stats, 3, 3)
+
         btn_row = QHBoxLayout()
         self.btn_load = QPushButton("Load Config")
         self.btn_save = QPushButton("Save Config")
@@ -157,6 +245,7 @@ class RegisterUI(QMainWindow):
 
         controls_wrap = QVBoxLayout()
         controls_wrap.addWidget(controls_box)
+        controls_wrap.addWidget(stats_box)
         controls_wrap.addLayout(btn_row)
 
         cfg_widget = QWidget()
@@ -187,13 +276,53 @@ class RegisterUI(QMainWindow):
         self.btn_start.clicked.connect(self.start_run)
         self.btn_stop.clicked.connect(self.stop_run)
         self.btn_clear.clicked.connect(self.log_edit.clear)
+        self.btn_refresh_stats.clicked.connect(self.refresh_pool_stats)
 
     def _set_status(self, text: str):
         self.status_label.setText(text)
 
+    def _set_stat(self, key: str, value):
+        try:
+            self._stats[key] = int(value)
+        except Exception:
+            return
+
+    def _ingest_stats_lines(self, text: str):
+        changed = False
+        for raw in text.splitlines():
+            m = STATS_LINE_RE.match(raw.strip())
+            if not m:
+                continue
+            self._set_stat(m.group(1).lower(), m.group(2))
+            changed = True
+        if changed:
+            self._refresh_stat_labels()
+
+    def _refresh_stat_labels(self):
+        self.pool_total_label.setText(str(self._stats.get("pool_total", "-")))
+        self.pool_unique_label.setText(str(self._stats.get("pool_unique", "-")))
+        self.run_success_label.setText(str(self._stats.get("run_success", 0)))
+        self.run_fail_label.setText(str(self._stats.get("run_fail", 0)))
+        self.token_json_label.setText(str(self._stats.get("token_json_total", "-")))
+
+        ak_total = self._stats.get("ak_total")
+        rk_total = self._stats.get("rk_total")
+        if ak_total is None or rk_total is None:
+            self.ak_rk_label.setText("-")
+        else:
+            self.ak_rk_label.setText(f"{ak_total} / {rk_total}")
+
+    def refresh_pool_stats(self):
+        output_file = self.output_edit.text().strip() or "registered_accounts.txt"
+        local = collect_local_pool_stats(output_file)
+        for key, value in local.items():
+            self._set_stat(key, value)
+        self._refresh_stat_labels()
+
     def append_log(self, text: str):
         if not text:
             return
+        self._ingest_stats_lines(text)
         text = redact_text(text)
         self.log_edit.moveCursor(QTextCursor.End)
         self.log_edit.insertPlainText(text)
@@ -215,6 +344,7 @@ class RegisterUI(QMainWindow):
 
     def _on_finished(self, code: int, status):
         self._set_status(f"Stopped (exit={code})")
+        self.refresh_pool_stats()
         self.append_log(f"\n[UI] Process finished with exit code {code}\n")
 
     def load_config(self):
@@ -239,6 +369,7 @@ class RegisterUI(QMainWindow):
         self.accounts_spin.setValue(max(1, int(cfg.get("total_accounts", 1) or 1)))
         self.output_edit.setText(str(cfg.get("output_file", "registered_accounts.txt") or "registered_accounts.txt"))
         self.proxy_edit.setText(str(cfg.get("proxy", "") or ""))
+        self.refresh_pool_stats()
         self._set_status("Config loaded")
 
     def save_config(self) -> bool:
@@ -275,6 +406,12 @@ class RegisterUI(QMainWindow):
         output_file = self.output_edit.text().strip() or "registered_accounts.txt"
         proxy = self.proxy_edit.text().strip()
         code = build_runner_code(module_name, accounts, output_file, workers, proxy)
+
+        self._set_stat("run_total", accounts)
+        self._set_stat("run_success", 0)
+        self._set_stat("run_fail", 0)
+        self.refresh_pool_stats()
+        self._refresh_stat_labels()
 
         self.log_edit.appendPlainText(
             f"[UI] Starting: {module_name} | accounts={accounts} workers={workers} proxy={'set' if proxy else 'none'}"

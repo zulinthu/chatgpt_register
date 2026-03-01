@@ -166,6 +166,103 @@ def _redact_text(value):
     return text
 
 
+def _project_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_project_path(path_value):
+    raw = str(path_value or "").strip()
+    if not raw:
+        return ""
+    if os.path.isabs(raw):
+        return raw
+    return os.path.join(_project_dir(), raw)
+
+
+def _count_nonempty_lines(path_value):
+    path = _resolve_project_path(path_value)
+    if not path or not os.path.exists(path):
+        return 0
+    count = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+    except Exception:
+        return 0
+    return count
+
+
+def _count_output_accounts(output_file):
+    path = _resolve_project_path(output_file)
+    if not path or not os.path.exists(path):
+        return 0, 0
+
+    total = 0
+    unique_emails = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                total += 1
+                email = line.split("----", 1)[0].strip().lower()
+                if email and "@" in email:
+                    unique_emails.add(email)
+    except Exception:
+        return 0, 0
+
+    return total, len(unique_emails)
+
+
+def _count_token_json_files():
+    token_dir = _resolve_project_path(TOKEN_JSON_DIR)
+    if not token_dir or not os.path.isdir(token_dir):
+        return 0
+    try:
+        return sum(
+            1
+            for name in os.listdir(token_dir)
+            if name.lower().endswith(".json")
+            and os.path.isfile(os.path.join(token_dir, name))
+        )
+    except Exception:
+        return 0
+
+
+def collect_pool_stats(output_file=None):
+    output = output_file or DEFAULT_OUTPUT_FILE
+    pool_total, pool_unique = _count_output_accounts(output)
+    return {
+        "pool_total": pool_total,
+        "pool_unique": pool_unique,
+        "token_json_total": _count_token_json_files(),
+        "ak_total": _count_nonempty_lines(AK_FILE),
+        "rk_total": _count_nonempty_lines(RK_FILE),
+    }
+
+
+def print_pool_stats(run_total=None, run_success=None, run_fail=None, output_file=None):
+    stats = collect_pool_stats(output_file=output_file)
+    if run_total is None and run_success is not None and run_fail is not None:
+        run_total = int(run_success) + int(run_fail)
+
+    if run_total is not None:
+        print(f"[STATS] run_total={int(run_total)}")
+    if run_success is not None:
+        print(f"[STATS] run_success={int(run_success)}")
+    if run_fail is not None:
+        print(f"[STATS] run_fail={int(run_fail)}")
+
+    print(f"[STATS] pool_total={stats['pool_total']}")
+    print(f"[STATS] pool_unique={stats['pool_unique']}")
+    print(f"[STATS] token_json_total={stats['token_json_total']}")
+    print(f"[STATS] ak_total={stats['ak_total']}")
+    print(f"[STATS] rk_total={stats['rk_total']}")
+
+
 # Chrome 指纹配置: impersonate 与 sec-ch-ua 必须匹配真实浏览器
 _CHROME_PROFILES = [
     {
@@ -1993,6 +2090,12 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
     print(f"  平均速度: {avg:.1f} 秒/个")
     if success_count > 0:
         print(f"  结果文件: {output_file}")
+    print_pool_stats(
+        run_total=total_accounts,
+        run_success=success_count,
+        run_fail=fail_count,
+        output_file=output_file,
+    )
     print(f"{'#'*60}")
 
 
