@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+codex_tokens/
+ak.txt
+rk.txt
+registered_accounts.txt
