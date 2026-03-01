@@ -241,9 +241,10 @@ class RegisterUI(QMainWindow):
         self.btn_start = QPushButton("Start")
         self.btn_stop = QPushButton("Stop")
         self.btn_clear = QPushButton("Clear Log")
+        self.btn_cleanup_invalid = QPushButton("Delete Invalid")
         self.status_label = QLabel("Idle")
 
-        for btn in [self.btn_load, self.btn_save, self.btn_start, self.btn_stop, self.btn_clear]:
+        for btn in [self.btn_load, self.btn_save, self.btn_start, self.btn_stop, self.btn_clear, self.btn_cleanup_invalid]:
             btn_row.addWidget(btn)
         btn_row.addStretch(1)
         btn_row.addWidget(QLabel("Status:"))
@@ -282,6 +283,7 @@ class RegisterUI(QMainWindow):
         self.btn_start.clicked.connect(self.start_run)
         self.btn_stop.clicked.connect(self.stop_run)
         self.btn_clear.clicked.connect(self.log_edit.clear)
+        self.btn_cleanup_invalid.clicked.connect(self.cleanup_invalid_accounts)
         self.btn_refresh_stats.clicked.connect(self.refresh_pool_stats)
 
     def _set_status(self, text: str):
@@ -325,6 +327,44 @@ class RegisterUI(QMainWindow):
         for key, value in local.items():
             self._set_stat(key, value)
         self._refresh_stat_labels()
+
+    def cleanup_invalid_accounts(self):
+        confirm = QMessageBox.question(
+            self,
+            "Delete Invalid",
+            "Delete invalid accounts now?\nOnly confirmed invalid tokens (401/403/no token) will be removed.\n5xx pending tokens will be kept.",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self._set_status("Cleaning...")
+        QApplication.processEvents()
+        try:
+            import chatgpt_register as base
+            output_file = self.output_edit.text().strip() or "registered_accounts.txt"
+            result = base.cleanup_invalid_accounts(output_file=output_file, live_check=True)
+            self.append_log(
+                "[UI] Cleanup result: "
+                f"checked={result.get('checked_count', 0)} "
+                f"deleted={result.get('deleted_count', 0)} "
+                f"kept={result.get('kept_count', 0)} "
+                f"pending={result.get('pending_count', 0)}\n"
+            )
+            self.refresh_pool_stats()
+            self._set_status("Cleanup done")
+            QMessageBox.information(
+                self,
+                "Cleanup done",
+                (
+                    f"Checked: {result.get('checked_count', 0)}\n"
+                    f"Deleted: {result.get('deleted_count', 0)}\n"
+                    f"Kept: {result.get('kept_count', 0)}\n"
+                    f"Pending(5xx): {result.get('pending_count', 0)}"
+                ),
+            )
+        except Exception as e:
+            self._set_status("Cleanup failed")
+            QMessageBox.critical(self, "Cleanup failed", str(e))
 
     def append_log(self, text: str):
         if not text:

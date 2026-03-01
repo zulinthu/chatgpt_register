@@ -431,6 +431,182 @@ def print_pool_stats(run_total=None, run_success=None, run_fail=None, run_added_
     print(f"[STATS] rk_total={stats['rk_total']}")
 
 
+def cleanup_invalid_accounts(output_file=None, live_check=True, dry_run=False):
+    """
+    删除明确无效账号:
+    - 无候选 token
+    - 主动验证返回 401/403
+    其余状态（如 5xx）视为待确认，不删除。
+    """
+    token_dir = _resolve_project_path(TOKEN_JSON_DIR)
+    if not token_dir or not os.path.isdir(token_dir):
+        return {
+            "deleted_count": 0,
+            "kept_count": 0,
+            "invalid_count": 0,
+            "pending_count": 0,
+            "checked_count": 0,
+            "deleted_emails": [],
+            "message": "token_json_dir_not_found",
+        }
+
+    json_files = [
+        os.path.join(token_dir, name)
+        for name in os.listdir(token_dir)
+        if name.lower().endswith(".json")
+        and os.path.isfile(os.path.join(token_dir, name))
+    ]
+    json_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+
+    deleted_files = []
+    deleted_emails = []
+    kept_token_data = []
+    invalid_count = 0
+    pending_count = 0
+    checked_count = 0
+
+    for fp in json_files:
+        checked_count += 1
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                token_data = json.load(f)
+        except Exception:
+            invalid_count += 1
+            deleted_files.append(fp)
+            deleted_emails.append(os.path.splitext(os.path.basename(fp))[0])
+            continue
+
+        email = str(token_data.get("email", "") or os.path.splitext(os.path.basename(fp))[0]).strip()
+        account_id = str(token_data.get("account_id", "") or "").strip()
+        candidate = str(
+            token_data.get("usable_bearer_token", "")
+            or token_data.get("api_key_access_token", "")
+            or token_data.get("access_token", "")
+            or ""
+        ).strip()
+
+        if not candidate:
+            invalid_count += 1
+            deleted_files.append(fp)
+            deleted_emails.append(email)
+            continue
+
+        verify_ok = token_data.get("active_verify_ok")
+        verify_status = token_data.get("active_verify_status")
+        verify_msg = str(token_data.get("active_verify_message", "") or "")
+
+        if live_check:
+            verify_ok, verify_status, verify_msg = _verify_openai_token_active(candidate, account_id=account_id)
+
+        if verify_ok is True:
+            kept_token_data.append(token_data)
+            continue
+
+        # 5xx 或网络错误按待确认保留
+        if isinstance(verify_status, int) and (verify_status >= 500 or verify_status < 0):
+            pending_count += 1
+            kept_token_data.append(token_data)
+            with _print_lock:
+                print(
+                    f"[CLEANUP] pending keep: {_mask_email(email)} "
+                    f"(status={verify_status}, msg={_redact_text(verify_msg)[:80]})"
+                )
+            continue
+
+        # 明确无效
+        if verify_status in (401, 403, 0, None):
+            invalid_count += 1
+            deleted_files.append(fp)
+            deleted_emails.append(email)
+            with _print_lock:
+                print(f"[CLEANUP] delete invalid: {_mask_email(email)} (status={verify_status})")
+            continue
+
+        # 其他状态默认保留，避免误删
+        pending_count += 1
+        kept_token_data.append(token_data)
+
+    # 删除无效 json
+    if not dry_run:
+        for fp in deleted_files:
+            try:
+                os.remove(fp)
+            except Exception:
+                pass
+
+    deleted_set = {str(e).strip().lower() for e in deleted_emails if str(e).strip()}
+
+    # 重建 ak / rk
+    ak_lines = []
+    rk_lines = []
+    seen_ak = set()
+    seen_rk = set()
+    for td in kept_token_data:
+        ak = str(
+            td.get("usable_bearer_token", "")
+            or td.get("api_key_access_token", "")
+            or td.get("access_token", "")
+            or ""
+        ).strip()
+        rk = str(td.get("refresh_token", "") or "").strip()
+        if ak and ak not in seen_ak:
+            seen_ak.add(ak)
+            ak_lines.append(ak)
+        if rk and rk not in seen_rk:
+            seen_rk.add(rk)
+            rk_lines.append(rk)
+
+    ak_path = _resolve_project_path(AK_FILE)
+    rk_path = _resolve_project_path(RK_FILE)
+    if not dry_run:
+        if ak_path:
+            with open(ak_path, "w", encoding="utf-8") as f:
+                if ak_lines:
+                    f.write("\n".join(ak_lines) + "\n")
+        if rk_path:
+            with open(rk_path, "w", encoding="utf-8") as f:
+                if rk_lines:
+                    f.write("\n".join(rk_lines) + "\n")
+
+    # 从账号输出文件移除被删账号
+    output = output_file or DEFAULT_OUTPUT_FILE
+    output_path = _resolve_project_path(output)
+    if (not dry_run) and output_path and os.path.isfile(output_path) and deleted_set:
+        kept_rows = []
+        try:
+            with open(output_path, "r", encoding="utf-8", errors="ignore") as f:
+                for raw in f:
+                    line = raw.rstrip("\n")
+                    if not line.strip():
+                        continue
+                    email = line.split("----", 1)[0].strip().lower()
+                    if email in deleted_set:
+                        continue
+                    kept_rows.append(line)
+            with open(output_path, "w", encoding="utf-8") as f:
+                if kept_rows:
+                    f.write("\n".join(kept_rows) + "\n")
+        except Exception:
+            pass
+
+    result = {
+        "deleted_count": len(deleted_files),
+        "kept_count": len(kept_token_data),
+        "invalid_count": invalid_count,
+        "pending_count": pending_count,
+        "checked_count": checked_count,
+        "deleted_emails": deleted_emails,
+        "dry_run": bool(dry_run),
+        "message": "ok",
+    }
+    with _print_lock:
+        print(
+            f"[CLEANUP] checked={checked_count} deleted={result['deleted_count']} "
+            f"kept={result['kept_count']} pending={pending_count}"
+        )
+    return result
+
+
 # Chrome 指纹配置: impersonate 与 sec-ch-ua 必须匹配真实浏览器
 _CHROME_PROFILES = [
     {
