@@ -7,6 +7,7 @@ from PyQt5.QtCore import QProcess
 from PyQt5.QtGui import QFont, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QGridLayout,
     QGroupBox,
@@ -191,6 +192,7 @@ class RegisterUI(QMainWindow):
         self.output_edit = QLineEdit("registered_accounts.txt")
         self.proxy_edit = QLineEdit("")
         self.proxy_edit.setPlaceholderText("blank means use None")
+        self.verify_token_checkbox = QCheckBox("Verify Token On Register")
 
         form.addWidget(QLabel("Python"), 0, 0)
         form.addWidget(self.python_edit, 0, 1, 1, 3)
@@ -204,6 +206,7 @@ class RegisterUI(QMainWindow):
         form.addWidget(self.output_edit, 2, 3)
         form.addWidget(QLabel("Proxy Override"), 3, 0)
         form.addWidget(self.proxy_edit, 3, 1, 1, 3)
+        form.addWidget(self.verify_token_checkbox, 4, 0, 1, 2)
 
         stats_box = QGroupBox("Stats")
         stats_grid = QGridLayout(stats_box)
@@ -211,6 +214,7 @@ class RegisterUI(QMainWindow):
         self.pool_unique_label = QLabel("-")
         self.run_success_label = QLabel("0")
         self.run_fail_label = QLabel("0")
+        self.run_added_unique_label = QLabel("0")
         self.token_json_label = QLabel("-")
         self.ak_rk_label = QLabel("-")
         self.btn_refresh_stats = QPushButton("Refresh Stats")
@@ -223,10 +227,12 @@ class RegisterUI(QMainWindow):
         stats_grid.addWidget(self.run_success_label, 1, 1)
         stats_grid.addWidget(QLabel("Run Fail"), 1, 2)
         stats_grid.addWidget(self.run_fail_label, 1, 3)
-        stats_grid.addWidget(QLabel("Token JSON"), 2, 0)
-        stats_grid.addWidget(self.token_json_label, 2, 1)
-        stats_grid.addWidget(QLabel("AK / RK"), 2, 2)
-        stats_grid.addWidget(self.ak_rk_label, 2, 3)
+        stats_grid.addWidget(QLabel("Added Unique"), 2, 0)
+        stats_grid.addWidget(self.run_added_unique_label, 2, 1)
+        stats_grid.addWidget(QLabel("Token JSON"), 2, 2)
+        stats_grid.addWidget(self.token_json_label, 2, 3)
+        stats_grid.addWidget(QLabel("AK / RK"), 3, 0)
+        stats_grid.addWidget(self.ak_rk_label, 3, 1)
         stats_grid.addWidget(self.btn_refresh_stats, 3, 3)
 
         btn_row = QHBoxLayout()
@@ -303,6 +309,7 @@ class RegisterUI(QMainWindow):
         self.pool_unique_label.setText(str(self._stats.get("pool_unique", "-")))
         self.run_success_label.setText(str(self._stats.get("run_success", 0)))
         self.run_fail_label.setText(str(self._stats.get("run_fail", 0)))
+        self.run_added_unique_label.setText(str(self._stats.get("run_added_unique", 0)))
         self.token_json_label.setText(str(self._stats.get("token_json_total", "-")))
 
         ak_total = self._stats.get("ak_total")
@@ -369,6 +376,7 @@ class RegisterUI(QMainWindow):
         self.accounts_spin.setValue(max(1, int(cfg.get("total_accounts", 1) or 1)))
         self.output_edit.setText(str(cfg.get("output_file", "registered_accounts.txt") or "registered_accounts.txt"))
         self.proxy_edit.setText(str(cfg.get("proxy", "") or ""))
+        self.verify_token_checkbox.setChecked(bool(cfg.get("verify_token_on_register", False)))
         self.refresh_pool_stats()
         self._set_status("Config loaded")
 
@@ -383,6 +391,7 @@ class RegisterUI(QMainWindow):
             value = parsed.get(key)
             if value == MASK_PLACEHOLDER and isinstance(self._loaded_config.get(key), str):
                 parsed[key] = self._loaded_config.get(key)
+        parsed["verify_token_on_register"] = bool(self.verify_token_checkbox.isChecked())
         try:
             CONFIG_PATH.write_text(json.dumps(parsed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             self._loaded_config = dict(parsed)
@@ -410,11 +419,13 @@ class RegisterUI(QMainWindow):
         self._set_stat("run_total", accounts)
         self._set_stat("run_success", 0)
         self._set_stat("run_fail", 0)
+        self._set_stat("run_added_unique", 0)
         self.refresh_pool_stats()
         self._refresh_stat_labels()
 
         self.log_edit.appendPlainText(
-            f"[UI] Starting: {module_name} | accounts={accounts} workers={workers} proxy={'set' if proxy else 'none'}"
+            f"[UI] Starting: {module_name} | accounts={accounts} workers={workers} "
+            f"proxy={'set' if proxy else 'none'} verify={'on' if self.verify_token_checkbox.isChecked() else 'off'}"
         )
         self.log_edit.appendPlainText(f"[UI] Python: {python_path}")
 

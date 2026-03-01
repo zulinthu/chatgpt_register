@@ -64,6 +64,9 @@ def _load_config():
         "codex_manager_rpc_token": "",
         "codex_manager_rpc_token_file": "",
         "codex_manager_timeout": 30,
+        "verify_token_on_register": False,
+        "verify_token_timeout": 30,
+        "verify_token_model": "gpt-4o-mini",
     }
 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -95,6 +98,9 @@ def _load_config():
     config["codex_manager_rpc_token"] = os.environ.get("CODEX_MANAGER_RPC_TOKEN", config["codex_manager_rpc_token"])
     config["codex_manager_rpc_token_file"] = os.environ.get("CODEX_MANAGER_RPC_TOKEN_FILE", config["codex_manager_rpc_token_file"])
     config["codex_manager_timeout"] = int(os.environ.get("CODEX_MANAGER_TIMEOUT", config["codex_manager_timeout"]))
+    config["verify_token_on_register"] = os.environ.get("VERIFY_TOKEN_ON_REGISTER", config["verify_token_on_register"])
+    config["verify_token_timeout"] = int(os.environ.get("VERIFY_TOKEN_TIMEOUT", config["verify_token_timeout"]))
+    config["verify_token_model"] = os.environ.get("VERIFY_TOKEN_MODEL", config["verify_token_model"])
 
     return config
 
@@ -128,6 +134,9 @@ CODEX_MANAGER_ADDR = str(_CONFIG.get("codex_manager_addr", "127.0.0.1:48760") or
 CODEX_MANAGER_RPC_TOKEN = str(_CONFIG.get("codex_manager_rpc_token", "") or "").strip()
 CODEX_MANAGER_RPC_TOKEN_FILE = str(_CONFIG.get("codex_manager_rpc_token_file", "") or "").strip()
 CODEX_MANAGER_TIMEOUT = int(_CONFIG.get("codex_manager_timeout", 30) or 30)
+VERIFY_TOKEN_ON_REGISTER = _as_bool(_CONFIG.get("verify_token_on_register", False))
+VERIFY_TOKEN_TIMEOUT = max(5, int(_CONFIG.get("verify_token_timeout", 30) or 30))
+VERIFY_TOKEN_MODEL = str(_CONFIG.get("verify_token_model", "gpt-4o-mini") or "gpt-4o-mini").strip()
 
 if not DUCKMAIL_BEARER:
     print("⚠️ 警告: 未设置 DUCKMAIL_BEARER，请在 config.json 中设置或设置环境变量")
@@ -400,7 +409,7 @@ def collect_pool_stats(output_file=None):
     }
 
 
-def print_pool_stats(run_total=None, run_success=None, run_fail=None, output_file=None):
+def print_pool_stats(run_total=None, run_success=None, run_fail=None, run_added_unique=None, output_file=None):
     stats = collect_pool_stats(output_file=output_file)
     if run_total is None and run_success is not None and run_fail is not None:
         run_total = int(run_success) + int(run_fail)
@@ -411,6 +420,8 @@ def print_pool_stats(run_total=None, run_success=None, run_fail=None, output_fil
         print(f"[STATS] run_success={int(run_success)}")
     if run_fail is not None:
         print(f"[STATS] run_fail={int(run_fail)}")
+    if run_added_unique is not None:
+        print(f"[STATS] run_added_unique={int(run_added_unique)}")
 
     print(f"[STATS] pool_total={stats['pool_total']}")
     print(f"[STATS] pool_unique={stats['pool_unique']}")
@@ -682,6 +693,55 @@ def _decode_jwt_payload(token: str):
         return {}
 
 
+def _verify_openai_token_active(token: str, account_id: str = ""):
+    bearer = str(token or "").strip()
+    if not bearer:
+        return False, 0, "empty_token"
+
+    session = curl_requests.Session()
+    if DEFAULT_PROXY:
+        session.proxies = {"http": DEFAULT_PROXY, "https": DEFAULT_PROXY}
+
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "Content-Type": "application/json",
+    }
+    aid = str(account_id or "").strip()
+    if aid:
+        headers["ChatGPT-Account-Id"] = aid
+
+    req_data = {
+        "model": VERIFY_TOKEN_MODEL or "gpt-4o-mini",
+        "input": "ping",
+        "max_output_tokens": 1,
+    }
+    try:
+        resp = session.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=req_data,
+            timeout=VERIFY_TOKEN_TIMEOUT,
+        )
+        status = int(resp.status_code)
+        body = str(resp.text or "")[:500]
+    except Exception as e:
+        return False, -1, f"request_error: {_redact_text(str(e))}"
+
+    body_l = body.lower()
+    if status in (200, 201):
+        return True, status, "ok"
+    if status == 429:
+        return True, status, "rate_limited"
+    if status in (401, 403):
+        return False, status, _redact_text(body)
+    if "missing scopes" in body_l or "invalid api key" in body_l or "invalid_token" in body_l:
+        return False, status, _redact_text(body)
+    if status == 400 and "model" in body_l and ("not found" in body_l or "does not exist" in body_l):
+        # 鉴权已通过，仅测试模型不可用
+        return True, status, "model_unavailable"
+    return False, status, _redact_text(body)
+
+
 def _save_codex_tokens(email: str, tokens: dict):
     access_token = str(tokens.get("access_token", "") or "")
     refresh_token = str(tokens.get("refresh_token", "") or "")
@@ -719,25 +779,45 @@ def _save_codex_tokens(email: str, tokens: dict):
                     usable_token = api_key_access_token
                     usable_source = "refreshed_token_exchange"
 
-    if usable_token:
-        with _file_lock:
-            with open(AK_FILE, "a", encoding="utf-8") as f:
-                f.write(f"{usable_token}\n")
-    else:
-        with _print_lock:
-            print(f"  [AK] skip unusable token for {_mask_email(email)} (missing api.responses.write)")
-
-    if refresh_token:
-        with _file_lock:
-            with open(RK_FILE, "a", encoding="utf-8") as f:
-                f.write(f"{refresh_token}\n")
-
     if not access_token and not usable_token:
         return
 
     payload = _decode_jwt_payload(access_token or usable_token)
     auth_info = payload.get("https://api.openai.com/auth", {})
     account_id = auth_info.get("chatgpt_account_id", "")
+
+    verify_ok = None
+    verify_status = None
+    verify_message = ""
+    if usable_token and VERIFY_TOKEN_ON_REGISTER:
+        verify_ok, verify_status, verify_message = _verify_openai_token_active(usable_token, account_id=account_id)
+        if verify_ok:
+            with _print_lock:
+                print(f"  [AK] active verify pass ({verify_status}) for {_mask_email(email)}")
+        else:
+            with _print_lock:
+                print(
+                    f"  [AK] active verify fail ({verify_status}) for {_mask_email(email)}: "
+                    f"{_redact_text(verify_message)}"
+                )
+            usable_token = ""
+            usable_source = ""
+
+    if usable_token:
+        with _file_lock:
+            with open(AK_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{usable_token}\n")
+    else:
+        with _print_lock:
+            if VERIFY_TOKEN_ON_REGISTER and verify_ok is False:
+                print(f"  [AK] skip save invalid token for {_mask_email(email)}")
+            else:
+                print(f"  [AK] skip unusable token for {_mask_email(email)} (missing api.responses.write)")
+
+    if refresh_token:
+        with _file_lock:
+            with open(RK_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{refresh_token}\n")
 
     exp_timestamp = payload.get("exp")
     expired_str = ""
@@ -761,6 +841,10 @@ def _save_codex_tokens(email: str, tokens: dict):
         "api_key_access_token": api_key_access_token,
         "usable_bearer_token": usable_token,
         "usable_bearer_source": usable_source,
+        "active_verify_enabled": bool(VERIFY_TOKEN_ON_REGISTER),
+        "active_verify_ok": verify_ok,
+        "active_verify_status": verify_status,
+        "active_verify_message": verify_message,
         "last_refresh": now.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
         "refresh_token": refresh_token,
     }
@@ -2280,6 +2364,7 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
         return
 
     actual_workers = min(max_workers, total_accounts)
+    before_stats = collect_pool_stats(output_file=output_file)
     print(f"\n{'#'*60}")
     print(f"  ChatGPT 批量自动注册 (DuckMail 临时邮箱版)")
     print(f"  注册数量: {total_accounts} | 并发数: {actual_workers}")
@@ -2289,6 +2374,10 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
         print(f"  OAuth Issuer: {OAUTH_ISSUER}")
         print(f"  OAuth Client: {OAUTH_CLIENT_ID}")
         print(f"  Token输出: {TOKEN_JSON_DIR}/, {AK_FILE}, {RK_FILE}")
+    print(
+        f"  Token主动验证: {'开启' if VERIFY_TOKEN_ON_REGISTER else '关闭'}"
+        f"{f' | model: {VERIFY_TOKEN_MODEL}' if VERIFY_TOKEN_ON_REGISTER else ''}"
+    )
     print(f"  输出文件: {output_file}")
     print(f"{'#'*60}\n")
 
@@ -2328,10 +2417,13 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
         print(f"  结果文件: {output_file}")
     if CODEX_MANAGER_ENABLED:
         sync_all_tokens_to_codex_manager()
+    after_stats = collect_pool_stats(output_file=output_file)
+    run_added_unique = max(0, int(after_stats.get("pool_unique", 0)) - int(before_stats.get("pool_unique", 0)))
     print_pool_stats(
         run_total=total_accounts,
         run_success=success_count,
         run_fail=fail_count,
+        run_added_unique=run_added_unique,
         output_file=output_file,
     )
     print(f"{'#'*60}")

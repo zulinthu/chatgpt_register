@@ -321,11 +321,16 @@ def run_batch(total_accounts=3, output_file="registered_accounts.txt", max_worke
     if IMAP_SERIAL_OTP and actual_workers > 1:
         print("[IMAP] serial OTP mode enabled; forcing workers=1 to avoid OTP cross-match.")
         actual_workers = 1
+    before_stats = base.collect_pool_stats(output_file=output_file)
     print(f"\n{'#'*60}")
     print("  ChatGPT Batch Register (IMAP mode)")
     print(f"  Accounts: {total_accounts} | Workers: {actual_workers}")
     print(f"  IMAP: {IMAP_HOST}:{IMAP_PORT} / {base._mask_email(IMAP_USER)}")
     print(f"  Alias: {base._mask_email(FIXED_EMAIL) if FIXED_EMAIL else f'{EMAIL_PREFIX}xxxxx@{EMAIL_DOMAIN}'}")
+    print(
+        f"  Token Verify: {'ON' if base.VERIFY_TOKEN_ON_REGISTER else 'OFF'}"
+        f"{f' | model: {base.VERIFY_TOKEN_MODEL}' if base.VERIFY_TOKEN_ON_REGISTER else ''}"
+    )
     print(f"{'#'*60}\n")
 
     success = 0
@@ -354,10 +359,13 @@ def run_batch(total_accounts=3, output_file="registered_accounts.txt", max_worke
     print(f"\nDone. success={success} fail={fail} elapsed={elapsed:.1f}s")
     if base.CODEX_MANAGER_ENABLED:
         base.sync_all_tokens_to_codex_manager()
+    after_stats = base.collect_pool_stats(output_file=output_file)
+    run_added_unique = max(0, int(after_stats.get("pool_unique", 0)) - int(before_stats.get("pool_unique", 0)))
     base.print_pool_stats(
         run_total=total_accounts,
         run_success=success,
         run_fail=fail,
+        run_added_unique=run_added_unique,
         output_file=output_file,
     )
 
