@@ -41,6 +41,10 @@ def _load_config():
         "token_json_dir": "codex_tokens",
         "upload_api_url": "",
         "upload_api_token": "",
+        "codex_manager_enabled": False,
+        "codex_manager_addr": "127.0.0.1:48760",
+        "codex_manager_rpc_token": "",
+        "codex_manager_timeout": 30,
     }
 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -67,6 +71,10 @@ def _load_config():
     config["token_json_dir"] = os.environ.get("TOKEN_JSON_DIR", config["token_json_dir"])
     config["upload_api_url"] = os.environ.get("UPLOAD_API_URL", config["upload_api_url"])
     config["upload_api_token"] = os.environ.get("UPLOAD_API_TOKEN", config["upload_api_token"])
+    config["codex_manager_enabled"] = os.environ.get("CODEX_MANAGER_ENABLED", config["codex_manager_enabled"])
+    config["codex_manager_addr"] = os.environ.get("CODEX_MANAGER_ADDR", config["codex_manager_addr"])
+    config["codex_manager_rpc_token"] = os.environ.get("CODEX_MANAGER_RPC_TOKEN", config["codex_manager_rpc_token"])
+    config["codex_manager_timeout"] = int(os.environ.get("CODEX_MANAGER_TIMEOUT", config["codex_manager_timeout"]))
 
     return config
 
@@ -95,6 +103,10 @@ RK_FILE = _CONFIG["rk_file"]
 TOKEN_JSON_DIR = _CONFIG["token_json_dir"]
 UPLOAD_API_URL = _CONFIG["upload_api_url"]
 UPLOAD_API_TOKEN = _CONFIG["upload_api_token"]
+CODEX_MANAGER_ENABLED = _as_bool(_CONFIG.get("codex_manager_enabled", False))
+CODEX_MANAGER_ADDR = str(_CONFIG.get("codex_manager_addr", "127.0.0.1:48760") or "127.0.0.1:48760").strip()
+CODEX_MANAGER_RPC_TOKEN = str(_CONFIG.get("codex_manager_rpc_token", "") or "").strip()
+CODEX_MANAGER_TIMEOUT = int(_CONFIG.get("codex_manager_timeout", 30) or 30)
 
 if not DUCKMAIL_BEARER:
     print("⚠️ 警告: 未设置 DUCKMAIL_BEARER，请在 config.json 中设置或设置环境变量")
@@ -427,9 +439,25 @@ def _save_codex_tokens(email: str, tokens: dict):
 
 
 def _upload_token_json(filepath):
-    """上传 Token JSON 文件到 CPA 管理平台"""
+    """Upload token JSON to CPA panel or Codex-Manager."""
+    if CODEX_MANAGER_ENABLED:
+        _upload_token_to_codex_manager(filepath)
+        return
+
     mp = None
     try:
+        auth_token = str(UPLOAD_API_TOKEN or "").strip()
+        if not auth_token:
+            with _print_lock:
+                print("  [CPA] ????: upload_api_token ??")
+            return
+        try:
+            auth_token.encode("latin-1")
+        except UnicodeEncodeError:
+            with _print_lock:
+                print("  [CPA] ????: upload_api_token ?? ASCII ???????? CPA token")
+            return
+
         from curl_cffi import CurlMime
 
         filename = os.path.basename(filepath)
@@ -448,7 +476,7 @@ def _upload_token_json(filepath):
         resp = session.post(
             UPLOAD_API_URL,
             multipart=mp,
-            headers={"Authorization": f"Bearer {UPLOAD_API_TOKEN}"},
+            headers={"Authorization": f"Bearer {auth_token}"},
             verify=False,
             timeout=30,
         )
@@ -465,6 +493,102 @@ def _upload_token_json(filepath):
     finally:
         if mp:
             mp.close()
+
+
+def _upload_token_to_codex_manager(filepath):
+    """Upload token JSON to Codex-Manager via JSON-RPC."""
+    try:
+        rpc_token = str(CODEX_MANAGER_RPC_TOKEN or "").strip()
+        if not rpc_token:
+            with _print_lock:
+                print("  [Codex-Manager] skip: codex_manager_rpc_token is empty")
+            return
+
+        try:
+            rpc_token.encode("latin-1")
+        except UnicodeEncodeError:
+            with _print_lock:
+                print("  [Codex-Manager] skip: codex_manager_rpc_token must be ASCII/latin-1")
+            return
+
+        addr = str(CODEX_MANAGER_ADDR or "").strip()
+        if not addr:
+            with _print_lock:
+                print("  [Codex-Manager] skip: codex_manager_addr is empty")
+            return
+        if addr.startswith("http://") or addr.startswith("https://"):
+            endpoint = f"{addr.rstrip('/')}/rpc"
+        else:
+            endpoint = f"http://{addr}/rpc"
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            token_data = json.load(f)
+
+        content_obj = {
+            "email": token_data.get("email", ""),
+            "tokens": {
+                "access_token": token_data.get("access_token", ""),
+                "id_token": token_data.get("id_token", ""),
+                "refresh_token": token_data.get("refresh_token", ""),
+            },
+        }
+        if token_data.get("account_id"):
+            content_obj["tokens"]["account_id"] = token_data.get("account_id")
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": int(time.time() * 1000),
+            "method": "account/import",
+            "params": {"content": json.dumps(content_obj, ensure_ascii=False)},
+        }
+
+        session = curl_requests.Session()
+        if DEFAULT_PROXY:
+            session.proxies = {"http": DEFAULT_PROXY, "https": DEFAULT_PROXY}
+
+        resp = session.post(
+            endpoint,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-CodexManager-Rpc-Token": rpc_token,
+            },
+            verify=False,
+            timeout=CODEX_MANAGER_TIMEOUT,
+        )
+
+        if resp.status_code != 200:
+            with _print_lock:
+                print(f"  [Codex-Manager] import failed: HTTP {resp.status_code} - {resp.text[:200]}")
+            return
+
+        try:
+            data = resp.json()
+        except Exception:
+            with _print_lock:
+                print(f"  [Codex-Manager] import failed: non-JSON response - {resp.text[:200]}")
+            return
+
+        if data.get("error"):
+            with _print_lock:
+                print(f"  [Codex-Manager] RPC error: {data.get('error')}")
+            return
+
+        result = data.get("result", {})
+        with _print_lock:
+            if isinstance(result, dict):
+                print(
+                    "  [Codex-Manager] import completed: "
+                    f"total={result.get('total', 0)} "
+                    f"created={result.get('created', 0)} "
+                    f"updated={result.get('updated', 0)} "
+                    f"failed={result.get('failed', 0)}"
+                )
+            else:
+                print("  [Codex-Manager] import completed")
+    except Exception as e:
+        with _print_lock:
+            print(f"  [Codex-Manager] import exception: {e}")
 
 
 def _generate_password(length=14):

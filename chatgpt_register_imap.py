@@ -137,6 +137,7 @@ class ChatGPTRegisterIMAP(base.ChatGPTRegister):
             ids.reverse()
             now_ts = time.time()
 
+            candidates = []
             for uid in ids:
                 status, msg_data = conn.fetch(uid, "(RFC822)")
                 if status != "OK" or not msg_data:
@@ -181,16 +182,24 @@ class ChatGPTRegisterIMAP(base.ChatGPTRegister):
                 if not likely_openai:
                     continue
 
-                recipient_text = " ".join([to_, cc, bcc, delivered_to, original_to, forwarded_to]).lower()
-                if recipient_text and target and target not in recipient_text:
-                    continue
-
                 text_body, html_body = self._extract_mail_bodies(msg)
                 merged = f"{subject}\n{text_body}\n{html_body}".lower()
-                if not recipient_text and target and target not in merged:
-                    continue
+                recipient_text = " ".join([to_, cc, bcc, delivered_to, original_to, forwarded_to]).lower()
+                # Some forwarding providers may not preserve alias in recipient headers.
+                # Prefer target-matched emails, but keep recent OpenAI verification emails as fallback.
+                score = 0
+                if target and target in recipient_text:
+                    score += 3
+                if target and target in merged:
+                    score += 2
+                if "verification" in subject_l or "verify" in subject_l:
+                    score += 1
 
                 msg_id = uid.decode() if isinstance(uid, bytes) else str(uid)
+                candidates.append((score, msg_id, text_body, html_body))
+
+            # Higher score first, then keep original scan order within same score.
+            for _, msg_id, text_body, html_body in sorted(candidates, key=lambda x: x[0], reverse=True):
                 msg_list.append({"id": msg_id})
                 detail_map[msg_id] = {"text": text_body, "html": html_body}
 
