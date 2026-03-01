@@ -352,7 +352,7 @@ class RegisterUI(QMainWindow):
             QMessageBox.warning(self, "Missing config", f"File not found:\n{CONFIG_PATH}")
             return
         try:
-            raw = CONFIG_PATH.read_text(encoding="utf-8")
+            raw = CONFIG_PATH.read_text(encoding="utf-8-sig")
             cfg = json.loads(raw)
         except Exception as e:
             QMessageBox.critical(self, "Load failed", str(e))
