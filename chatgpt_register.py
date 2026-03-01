@@ -117,6 +117,54 @@ if not DUCKMAIL_BEARER:
 _print_lock = threading.Lock()
 _file_lock = threading.Lock()
 
+_EMAIL_RE = re.compile(r"\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+\b")
+_RT_RE = re.compile(r"\brt_[A-Za-z0-9._-]+\b")
+_BEARER_RE = re.compile(r"(?i)(Bearer\s+)([A-Za-z0-9._~+/\-=]{8,})")
+_SENSITIVE_KV_RE = re.compile(
+    r'(?i)((?:access_token|id_token|refresh_token|password|duckmail_bearer|upload_api_token|codex_manager_rpc_token|mail_token)\s*[=:]\s*)([^\s,]+)'
+)
+_OTP_RE = re.compile(r"(?i)(otp|verification code|\u9a8c\u8bc1\u7801)\D{0,8}(\d{6})")
+_QUERY_PARAM_RE = re.compile(
+    r"(?i)([?&](?:login_hint|state|code|device_id|ext-oai-did|auth_session_logging_id|csrfToken|oai-did|id_token|access_token|refresh_token)=)([^&\s]+)"
+)
+_JSON_SENSITIVE_VALUE_RE = re.compile(
+    r'(?i)("(?:csrfToken|state|code|device_id|auth_session_logging_id|login_hint|access_token|id_token|refresh_token)"\s*:\s*")([^"]+)(")'
+)
+
+
+def _mask_text(value, head=2, tail=2):
+    s = str(value or "")
+    if not s:
+        return s
+    if len(s) <= head + tail:
+        return "*" * len(s)
+    return f"{s[:head]}{'*' * (len(s) - head - tail)}{s[-tail:]}"
+
+
+def _mask_email(value):
+    s = str(value or "")
+    if "@" not in s:
+        return _mask_text(s, 2, 2)
+    local, domain = s.split("@", 1)
+    return f"{_mask_text(local, 2, 1)}@{_mask_text(domain, 1, 3)}"
+
+
+def _redact_text(value):
+    text = str(value or "")
+    if not text:
+        return text
+
+    text = _EMAIL_RE.sub(lambda m: _mask_email(m.group(0)), text)
+    text = _JWT_RE.sub(lambda m: _mask_text(m.group(0), 8, 6), text)
+    text = _RT_RE.sub(lambda m: _mask_text(m.group(0), 6, 4), text)
+    text = _BEARER_RE.sub(lambda m: f"{m.group(1)}{_mask_text(m.group(2), 6, 4)}", text)
+    text = _SENSITIVE_KV_RE.sub(lambda m: f"{m.group(1)}{_mask_text(m.group(2), 2, 2)}", text)
+    text = _OTP_RE.sub(lambda m: f"{m.group(1)} ******", text)
+    text = _QUERY_PARAM_RE.sub(lambda m: f"{m.group(1)}{_mask_text(m.group(2), 4, 3)}", text)
+    text = _JSON_SENSITIVE_VALUE_RE.sub(lambda m: f"{m.group(1)}{_mask_text(m.group(2), 4, 3)}{m.group(3)}", text)
+    return text
+
 
 # Chrome 指纹配置: impersonate 与 sec-ch-ua 必须匹配真实浏览器
 _CHROME_PROFILES = [
@@ -744,22 +792,27 @@ def _extract_verification_code(email_content: str):
 def wait_for_verification_email(mail_token: str, timeout: int = 120):
     """等待并提取 OpenAI 验证码"""
     start_time = time.time()
+    consumed_ids = set()
 
     while time.time() - start_time < timeout:
         messages = _fetch_emails_duckmail(mail_token)
         if messages and len(messages) > 0:
-            # 获取最新邮件详情
-            first_msg = messages[0]
-            msg_id = first_msg.get("id") or first_msg.get("@id")
+            for msg in messages:
+                msg_id = msg.get("id") or msg.get("@id")
+                msg_key = str(msg_id or "").strip()
+                if not msg_key:
+                    continue
+                if msg_key in consumed_ids:
+                    continue
 
-            if msg_id:
                 detail = _fetch_email_detail_duckmail(mail_token, msg_id)
-                if detail:
-                    # DuckMail 的邮件内容在 text 或 html 字段
-                    content = detail.get("text") or detail.get("html") or ""
-                    code = _extract_verification_code(content)
-                    if code:
-                        return code
+                if not detail:
+                    continue
+                content = detail.get("text") or detail.get("html") or ""
+                code = _extract_verification_code(content)
+                if code:
+                    consumed_ids.add(msg_key)
+                    return code
 
         time.sleep(3)
 
@@ -820,6 +873,7 @@ class ChatGPTRegister:
 
         self.session.cookies.set("oai-did", self.device_id, domain="chatgpt.com")
         self._callback_url = None
+        self._consumed_otp_message_ids = set()
 
     def _log(self, step, method, url, status, body=None):
         prefix = f"[{self.tag}] " if self.tag else ""
@@ -831,17 +885,17 @@ class ChatGPTRegister:
         ]
         if body:
             try:
-                lines.append(f"{prefix}[Response] {json.dumps(body, indent=2, ensure_ascii=False)[:1000]}")
+                lines.append(f"{prefix}[Response] {_redact_text(json.dumps(body, indent=2, ensure_ascii=False)[:1000])}")
             except Exception:
-                lines.append(f"{prefix}[Response] {str(body)[:1000]}")
+                lines.append(f"{prefix}[Response] {_redact_text(str(body)[:1000])}")
         lines.append(f"{'='*60}")
         with _print_lock:
-            print("\n".join(lines))
+            print("\n".join(_redact_text(line) for line in lines))
 
     def _print(self, msg):
         prefix = f"[{self.tag}] " if self.tag else ""
         with _print_lock:
-            print(f"{prefix}{msg}")
+            print(f"{prefix}{_redact_text(msg)}")
 
     # ==================== DuckMail 临时邮箱 ====================
 
@@ -983,17 +1037,23 @@ class ChatGPTRegister:
         while time.time() - start_time < timeout:
             messages = self._fetch_emails_duckmail(mail_token)
             if messages and len(messages) > 0:
-                first_msg = messages[0]
-                msg_id = first_msg.get("id") or first_msg.get("@id")
+                for msg in messages:
+                    msg_id = msg.get("id") or msg.get("@id")
+                    msg_key = str(msg_id or "").strip()
+                    if not msg_key:
+                        continue
+                    if msg_key in self._consumed_otp_message_ids:
+                        continue
 
-                if msg_id:
                     detail = self._fetch_email_detail_duckmail(mail_token, msg_id)
-                    if detail:
-                        content = detail.get("text") or detail.get("html") or ""
-                        code = self._extract_verification_code(content)
-                        if code:
-                            self._print(f"[OTP] 验证码: {code}")
-                            return code
+                    if not detail:
+                        continue
+                    content = detail.get("text") or detail.get("html") or ""
+                    code = self._extract_verification_code(content)
+                    if code:
+                        self._consumed_otp_message_ids.add(msg_key)
+                        self._print(f"[OTP] 验证码: {code}")
+                        return code
 
             elapsed = int(time.time() - start_time)
             self._print(f"[OTP] 等待中... ({elapsed}s/{timeout}s)")
@@ -1835,9 +1895,9 @@ def _register_one(idx, total, proxy, output_file):
 
         with _print_lock:
             print(f"\n{'='*60}")
-            print(f"  [{idx}/{total}] 注册: {email}")
-            print(f"  ChatGPT密码: {chatgpt_password}")
-            print(f"  邮箱密码: {email_pwd}")
+            print(f"  [{idx}/{total}] 注册: {_mask_email(email)}")
+            print(f"  ChatGPT密码: {_mask_text(chatgpt_password, 2, 2)}")
+            print(f"  邮箱密码: {_mask_text(email_pwd, 2, 2)}")
             print(f"  姓名: {name} | 生日: {birthdate}")
             print(f"{'='*60}")
 
@@ -1865,13 +1925,13 @@ def _register_one(idx, total, proxy, output_file):
                 out.write(f"{email}----{chatgpt_password}----{email_pwd}----oauth={'ok' if oauth_ok else 'fail'}\n")
 
         with _print_lock:
-            print(f"\n[OK] [{tag}] {email} 注册成功!")
+            print(f"\n[OK] [{tag}] {_mask_email(email)} 注册成功!")
         return True, email, None
 
     except Exception as e:
         error_msg = str(e)
         with _print_lock:
-            print(f"\n[FAIL] [{idx}] 注册失败: {error_msg}")
+            print(f"\n[FAIL] [{idx}] 注册失败: {_redact_text(error_msg)}")
             traceback.print_exc()
         return False, None, error_msg
 
@@ -1953,7 +2013,7 @@ def main():
     # 交互式代理配置
     proxy = DEFAULT_PROXY
     if proxy:
-        print(f"[Info] 检测到默认代理: {proxy}")
+        print(f"[Info] 检测到默认代理: {_redact_text(proxy)}")
         use_default = input("使用此代理? (Y/n): ").strip().lower()
         if use_default == "n":
             proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
@@ -1961,7 +2021,7 @@ def main():
         env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
                  or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
         if env_proxy:
-            print(f"[Info] 检测到环境变量代理: {env_proxy}")
+            print(f"[Info] 检测到环境变量代理: {_redact_text(env_proxy)}")
             use_env = input("使用此代理? (Y/n): ").strip().lower()
             if use_env == "n":
                 proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
@@ -1971,7 +2031,7 @@ def main():
             proxy = input("输入代理地址 (如 http://127.0.0.1:7890，留空=不使用代理): ").strip() or None
 
     if proxy:
-        print(f"[Info] 使用代理: {proxy}")
+        print(f"[Info] 使用代理: {_redact_text(proxy)}")
     else:
         print("[Info] 不使用代理")
 

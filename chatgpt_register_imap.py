@@ -50,6 +50,9 @@ IMAP_SSL = _as_bool(os.environ.get("IMAP_SSL", base._CONFIG.get("imap_ssl", True
 EMAIL_DOMAIN = os.environ.get("EMAIL_DOMAIN", str(base._CONFIG.get("email_domain", "")).strip())
 EMAIL_PREFIX = os.environ.get("EMAIL_PREFIX", str(base._CONFIG.get("email_prefix", "auto")).strip() or "auto")
 FIXED_EMAIL = os.environ.get("FIXED_EMAIL", str(base._CONFIG.get("fixed_email", "")).strip())
+IMAP_STRICT_TARGET_MATCH = _as_bool(os.environ.get("IMAP_STRICT_TARGET_MATCH", base._CONFIG.get("imap_strict_target_match", True)))
+IMAP_ALLOW_FALLBACK_MATCH = _as_bool(os.environ.get("IMAP_ALLOW_FALLBACK_MATCH", base._CONFIG.get("imap_allow_fallback_match", False)))
+IMAP_SERIAL_OTP = _as_bool(os.environ.get("IMAP_SERIAL_OTP", base._CONFIG.get("imap_serial_otp", True)))
 
 
 def _has_imap_config():
@@ -120,6 +123,7 @@ class ChatGPTRegisterIMAP(base.ChatGPTRegister):
     def _scan_imap_for_target(self, target_email, limit=40):
         conn = None
         target = str(target_email or "").strip().lower()
+        target_url = target.replace("@", "%40") if target else ""
         msg_list = []
         detail_map = {}
         try:
@@ -137,7 +141,8 @@ class ChatGPTRegisterIMAP(base.ChatGPTRegister):
             ids.reverse()
             now_ts = time.time()
 
-            candidates = []
+            strict_candidates = []
+            fallback_candidates = []
             for uid in ids:
                 status, msg_data = conn.fetch(uid, "(RFC822)")
                 if status != "OK" or not msg_data:
@@ -185,21 +190,28 @@ class ChatGPTRegisterIMAP(base.ChatGPTRegister):
                 text_body, html_body = self._extract_mail_bodies(msg)
                 merged = f"{subject}\n{text_body}\n{html_body}".lower()
                 recipient_text = " ".join([to_, cc, bcc, delivered_to, original_to, forwarded_to]).lower()
-                # Some forwarding providers may not preserve alias in recipient headers.
-                # Prefer target-matched emails, but keep recent OpenAI verification emails as fallback.
-                score = 0
-                if target and target in recipient_text:
-                    score += 3
-                if target and target in merged:
-                    score += 2
-                if "verification" in subject_l or "verify" in subject_l:
-                    score += 1
+                target_hit_headers = bool(target and (target in recipient_text or (target_url and target_url in recipient_text)))
+                target_hit_body = bool(target and (target in merged or (target_url and target_url in merged)))
+                target_matched = target_hit_headers or target_hit_body
+
+                if IMAP_STRICT_TARGET_MATCH and target and not target_matched:
+                    if not IMAP_ALLOW_FALLBACK_MATCH:
+                        continue
 
                 msg_id = uid.decode() if isinstance(uid, bytes) else str(uid)
-                candidates.append((score, msg_id, text_body, html_body))
+                item = (msg_id, text_body, html_body)
+                if target_matched:
+                    strict_candidates.append(item)
+                else:
+                    fallback_candidates.append(item)
 
-            # Higher score first, then keep original scan order within same score.
-            for _, msg_id, text_body, html_body in sorted(candidates, key=lambda x: x[0], reverse=True):
+            selected = strict_candidates if strict_candidates else fallback_candidates
+            if strict_candidates:
+                self._print(f"[IMAP] target-matched mails: {len(strict_candidates)}")
+            elif fallback_candidates:
+                self._print(f"[IMAP] warning: using fallback mails: {len(fallback_candidates)}")
+
+            for msg_id, text_body, html_body in selected:
                 msg_list.append({"id": msg_id})
                 detail_map[msg_id] = {"text": text_body, "html": html_body}
 
@@ -263,9 +275,9 @@ def _register_one(idx, total, proxy, output_file):
 
         with base._print_lock:
             print(f"\n{'='*60}")
-            print(f"  [{idx}/{total}] 注册: {email_addr}")
-            print(f"  ChatGPT密码: {chatgpt_password}")
-            print(f"  邮箱密码: {email_pwd}")
+            print(f"  [{idx}/{total}] 注册: {base._mask_email(email_addr)}")
+            print(f"  ChatGPT密码: {base._mask_text(chatgpt_password, 2, 2)}")
+            print(f"  邮箱密码: {base._mask_text(email_pwd, 2, 2)}")
             print(f"  姓名: {name} | 生日: {birthdate}")
             print(f"{'='*60}")
 
@@ -289,12 +301,12 @@ def _register_one(idx, total, proxy, output_file):
                 out.write(f"{email_addr}----{chatgpt_password}----{email_pwd}----oauth={'ok' if oauth_ok else 'fail'}\n")
 
         with base._print_lock:
-            print(f"\n[OK] [{tag}] {email_addr} 注册成功!")
+            print(f"\n[OK] [{tag}] {base._mask_email(email_addr)} 注册成功!")
         return True, email_addr, None
     except Exception as e:
         err = str(e)
         with base._print_lock:
-            print(f"\n[FAIL] [{idx}] 注册失败: {err}")
+            print(f"\n[FAIL] [{idx}] 注册失败: {base._redact_text(err)}")
             traceback.print_exc()
         return False, None, err
 
@@ -306,11 +318,14 @@ def run_batch(total_accounts=3, output_file="registered_accounts.txt", max_worke
         return
 
     actual_workers = min(max_workers, total_accounts)
+    if IMAP_SERIAL_OTP and actual_workers > 1:
+        print("[IMAP] serial OTP mode enabled; forcing workers=1 to avoid OTP cross-match.")
+        actual_workers = 1
     print(f"\n{'#'*60}")
     print("  ChatGPT Batch Register (IMAP mode)")
     print(f"  Accounts: {total_accounts} | Workers: {actual_workers}")
-    print(f"  IMAP: {IMAP_HOST}:{IMAP_PORT} / {IMAP_USER}")
-    print(f"  Alias: {FIXED_EMAIL if FIXED_EMAIL else f'{EMAIL_PREFIX}xxxxx@{EMAIL_DOMAIN}'}")
+    print(f"  IMAP: {IMAP_HOST}:{IMAP_PORT} / {base._mask_email(IMAP_USER)}")
+    print(f"  Alias: {base._mask_email(FIXED_EMAIL) if FIXED_EMAIL else f'{EMAIL_PREFIX}xxxxx@{EMAIL_DOMAIN}'}")
     print(f"{'#'*60}\n")
 
     success = 0
@@ -350,7 +365,7 @@ def main():
 
     proxy = base.DEFAULT_PROXY
     if proxy:
-        use_default = input(f"Use default proxy {proxy}? (Y/n): ").strip().lower()
+        use_default = input(f"Use default proxy {base._redact_text(proxy)}? (Y/n): ").strip().lower()
         if use_default == "n":
             proxy = input("Proxy (blank=no proxy): ").strip() or None
     else:
