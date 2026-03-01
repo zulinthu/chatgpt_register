@@ -352,6 +352,8 @@ def run_batch(total_accounts=3, output_file="registered_accounts.txt", max_worke
 
     elapsed = time.time() - start
     print(f"\nDone. success={success} fail={fail} elapsed={elapsed:.1f}s")
+    if base.CODEX_MANAGER_ENABLED:
+        base.sync_all_tokens_to_codex_manager()
     base.print_pool_stats(
         run_total=total_accounts,
         run_success=success,

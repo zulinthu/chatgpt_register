@@ -1,4 +1,4 @@
-"""
+﻿"""
 ChatGPT 批量自动注册工具 (并发版) - DuckMail 临时邮箱版
 依赖: pip install curl_cffi
 功能: 使用 DuckMail 临时邮箱，并发自动注册 ChatGPT 账号，自动获取 OTP 验证码
@@ -44,6 +44,7 @@ def _load_config():
         "codex_manager_enabled": False,
         "codex_manager_addr": "127.0.0.1:48760",
         "codex_manager_rpc_token": "",
+        "codex_manager_rpc_token_file": "",
         "codex_manager_timeout": 30,
     }
 
@@ -74,6 +75,7 @@ def _load_config():
     config["codex_manager_enabled"] = os.environ.get("CODEX_MANAGER_ENABLED", config["codex_manager_enabled"])
     config["codex_manager_addr"] = os.environ.get("CODEX_MANAGER_ADDR", config["codex_manager_addr"])
     config["codex_manager_rpc_token"] = os.environ.get("CODEX_MANAGER_RPC_TOKEN", config["codex_manager_rpc_token"])
+    config["codex_manager_rpc_token_file"] = os.environ.get("CODEX_MANAGER_RPC_TOKEN_FILE", config["codex_manager_rpc_token_file"])
     config["codex_manager_timeout"] = int(os.environ.get("CODEX_MANAGER_TIMEOUT", config["codex_manager_timeout"]))
 
     return config
@@ -106,6 +108,7 @@ UPLOAD_API_TOKEN = _CONFIG["upload_api_token"]
 CODEX_MANAGER_ENABLED = _as_bool(_CONFIG.get("codex_manager_enabled", False))
 CODEX_MANAGER_ADDR = str(_CONFIG.get("codex_manager_addr", "127.0.0.1:48760") or "127.0.0.1:48760").strip()
 CODEX_MANAGER_RPC_TOKEN = str(_CONFIG.get("codex_manager_rpc_token", "") or "").strip()
+CODEX_MANAGER_RPC_TOKEN_FILE = str(_CONFIG.get("codex_manager_rpc_token_file", "") or "").strip()
 CODEX_MANAGER_TIMEOUT = int(_CONFIG.get("codex_manager_timeout", 30) or 30)
 
 if not DUCKMAIL_BEARER:
@@ -177,6 +180,39 @@ def _resolve_project_path(path_value):
     if os.path.isabs(raw):
         return raw
     return os.path.join(_project_dir(), raw)
+
+
+def _read_text_file(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _resolve_codex_manager_rpc_token():
+    direct = str(CODEX_MANAGER_RPC_TOKEN or "").strip()
+    if direct:
+        return direct
+
+    candidates = []
+    custom = str(CODEX_MANAGER_RPC_TOKEN_FILE or "").strip()
+    if custom:
+        candidates.append(_resolve_project_path(custom))
+
+    proj = _project_dir()
+    candidates.extend([
+        os.path.join(proj, "..", "codex_manage", "target", "debug", "codexmanager.rpc-token"),
+        os.path.join(proj, "codexmanager.rpc-token"),
+        os.path.join(proj, "target", "debug", "codexmanager.rpc-token"),
+    ])
+
+    for p in candidates:
+        if p and os.path.isfile(p):
+            token = _read_text_file(p)
+            if token:
+                return token
+    return ""
 
 
 def _count_nonempty_lines(path_value):
@@ -579,7 +615,7 @@ def _save_codex_tokens(email: str, tokens: dict):
             json.dump(token_data, f, ensure_ascii=False)
 
     # 上传到 CPA 管理平台
-    if UPLOAD_API_URL:
+    if CODEX_MANAGER_ENABLED or UPLOAD_API_URL:
         _upload_token_json(token_path)
 
 
@@ -643,24 +679,24 @@ def _upload_token_json(filepath):
 def _upload_token_to_codex_manager(filepath):
     """Upload token JSON to Codex-Manager via JSON-RPC."""
     try:
-        rpc_token = str(CODEX_MANAGER_RPC_TOKEN or "").strip()
+        rpc_token = _resolve_codex_manager_rpc_token()
         if not rpc_token:
             with _print_lock:
-                print("  [Codex-Manager] skip: codex_manager_rpc_token is empty")
-            return
+                print("  [Codex-Manager] skip: rpc token is empty (config + token file)")
+            return False
 
         try:
             rpc_token.encode("latin-1")
         except UnicodeEncodeError:
             with _print_lock:
                 print("  [Codex-Manager] skip: codex_manager_rpc_token must be ASCII/latin-1")
-            return
+            return False
 
         addr = str(CODEX_MANAGER_ADDR or "").strip()
         if not addr:
             with _print_lock:
                 print("  [Codex-Manager] skip: codex_manager_addr is empty")
-            return
+            return False
         if addr.startswith("http://") or addr.startswith("https://"):
             endpoint = f"{addr.rstrip('/')}/rpc"
         else:
@@ -705,19 +741,19 @@ def _upload_token_to_codex_manager(filepath):
         if resp.status_code != 200:
             with _print_lock:
                 print(f"  [Codex-Manager] import failed: HTTP {resp.status_code} - {resp.text[:200]}")
-            return
+            return False
 
         try:
             data = resp.json()
         except Exception:
             with _print_lock:
                 print(f"  [Codex-Manager] import failed: non-JSON response - {resp.text[:200]}")
-            return
+            return False
 
         if data.get("error"):
             with _print_lock:
                 print(f"  [Codex-Manager] RPC error: {data.get('error')}")
-            return
+            return False
 
         result = data.get("result", {})
         with _print_lock:
@@ -731,9 +767,48 @@ def _upload_token_to_codex_manager(filepath):
                 )
             else:
                 print("  [Codex-Manager] import completed")
+        return True
     except Exception as e:
         with _print_lock:
             print(f"  [Codex-Manager] import exception: {e}")
+        return False
+
+
+def sync_all_tokens_to_codex_manager():
+    if not CODEX_MANAGER_ENABLED:
+        return {"total": 0, "ok": 0, "fail": 0}
+
+    token_dir = _resolve_project_path(TOKEN_JSON_DIR)
+    if not token_dir or not os.path.isdir(token_dir):
+        with _print_lock:
+            print(f"[Codex-Manager] sync skip: token dir not found: {token_dir}")
+        return {"total": 0, "ok": 0, "fail": 0}
+
+    files = sorted(
+        os.path.join(token_dir, name)
+        for name in os.listdir(token_dir)
+        if name.lower().endswith(".json")
+    )
+    total = len(files)
+    ok = 0
+    fail = 0
+    if total == 0:
+        with _print_lock:
+            print("[Codex-Manager] sync skip: no token json files")
+        return {"total": 0, "ok": 0, "fail": 0}
+
+    with _print_lock:
+        print(f"[Codex-Manager] sync all tokens start: total={total}")
+
+    for fp in files:
+        if _upload_token_to_codex_manager(fp):
+            ok += 1
+        else:
+            fail += 1
+
+    with _print_lock:
+        print(f"[Codex-Manager] sync all tokens done: total={total} ok={ok} fail={fail}")
+    return {"total": total, "ok": ok, "fail": fail}
 
 
 def _generate_password(length=14):
@@ -2090,6 +2165,8 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
     print(f"  平均速度: {avg:.1f} 秒/个")
     if success_count > 0:
         print(f"  结果文件: {output_file}")
+    if CODEX_MANAGER_ENABLED:
+        sync_all_tokens_to_codex_manager()
     print_pool_stats(
         run_total=total_accounts,
         run_success=success_count,
@@ -2151,3 +2228,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
