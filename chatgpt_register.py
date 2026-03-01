@@ -713,7 +713,7 @@ def _verify_openai_token_active(token: str, account_id: str = ""):
     req_data = {
         "model": VERIFY_TOKEN_MODEL or "gpt-4o-mini",
         "input": "ping",
-        "max_output_tokens": 1,
+        "max_output_tokens": 16,
     }
     try:
         resp = session.post(
@@ -727,11 +727,40 @@ def _verify_openai_token_active(token: str, account_id: str = ""):
     except Exception as e:
         return False, -1, f"request_error: {_redact_text(str(e))}"
 
+    if status >= 500:
+        time.sleep(1.0)
+        try:
+            resp2 = session.post(
+                "https://api.openai.com/v1/responses",
+                headers=headers,
+                json=req_data,
+                timeout=VERIFY_TOKEN_TIMEOUT,
+            )
+            status = int(resp2.status_code)
+            body = str(resp2.text or "")[:500]
+        except Exception as e:
+            return False, -1, f"request_error_retry: {_redact_text(str(e))}"
+
     body_l = body.lower()
     if status in (200, 201):
         return True, status, "ok"
     if status == 429:
         return True, status, "rate_limited"
+    if status >= 500:
+        # 5xx 常见于上游/代理链路抖动；补测一次 models 读权限用于分类
+        try:
+            r_models = session.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {bearer}"},
+                timeout=VERIFY_TOKEN_TIMEOUT,
+            )
+            m_status = int(r_models.status_code)
+            m_body = str(r_models.text or "")[:240]
+            if m_status in (200, 429):
+                return False, status, f"responses_5xx_models_ok:{m_status}"
+            return False, status, f"responses_5xx_models_fail:{m_status}:{_redact_text(m_body)}"
+        except Exception as e:
+            return False, status, f"responses_5xx_models_check_error:{_redact_text(str(e))}"
     if status in (401, 403):
         return False, status, _redact_text(body)
     if "missing scopes" in body_l or "invalid api key" in body_l or "invalid_token" in body_l:
@@ -795,13 +824,20 @@ def _save_codex_tokens(email: str, tokens: dict):
             with _print_lock:
                 print(f"  [AK] active verify pass ({verify_status}) for {_mask_email(email)}")
         else:
-            with _print_lock:
-                print(
-                    f"  [AK] active verify fail ({verify_status}) for {_mask_email(email)}: "
-                    f"{_redact_text(verify_message)}"
-                )
-            usable_token = ""
-            usable_source = ""
+            if isinstance(verify_status, int) and verify_status >= 500:
+                with _print_lock:
+                    print(
+                        f"  [AK] active verify pending ({verify_status}) for {_mask_email(email)}: "
+                        f"{_redact_text(verify_message)}"
+                    )
+            else:
+                with _print_lock:
+                    print(
+                        f"  [AK] active verify fail ({verify_status}) for {_mask_email(email)}: "
+                        f"{_redact_text(verify_message)}"
+                    )
+                usable_token = ""
+                usable_source = ""
 
     if usable_token:
         with _file_lock:
@@ -809,7 +845,7 @@ def _save_codex_tokens(email: str, tokens: dict):
                 f.write(f"{usable_token}\n")
     else:
         with _print_lock:
-            if VERIFY_TOKEN_ON_REGISTER and verify_ok is False:
+            if VERIFY_TOKEN_ON_REGISTER and verify_ok is False and isinstance(verify_status, int) and verify_status < 500:
                 print(f"  [AK] skip save invalid token for {_mask_email(email)}")
             else:
                 print(f"  [AK] skip unusable token for {_mask_email(email)} (missing api.responses.write)")
