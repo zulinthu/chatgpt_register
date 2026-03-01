@@ -22,6 +22,24 @@ from urllib.parse import urlparse, parse_qs, urlencode
 
 from curl_cffi import requests as curl_requests
 
+
+def _ensure_utf8_stdio():
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if not stream:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_ensure_utf8_stdio()
+
+
 # ================= 加载配置 =================
 def _load_config():
     """从 config.json 加载配置，环境变量优先级更高"""
@@ -51,7 +69,7 @@ def _load_config():
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
     if os.path.exists(config_path):
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, "r", encoding="utf-8-sig") as f:
                 file_config = json.load(f)
                 config.update(file_config)
         except Exception as e:
@@ -134,6 +152,83 @@ _QUERY_PARAM_RE = re.compile(
 _JSON_SENSITIVE_VALUE_RE = re.compile(
     r'(?i)("(?:csrfToken|state|code|device_id|auth_session_logging_id|login_hint|access_token|id_token|refresh_token)"\s*:\s*")([^"]+)(")'
 )
+
+
+def _token_scope_set(token: str):
+    payload = _decode_jwt_payload(token or "")
+    if not payload:
+        return set()
+    raw = payload.get("scope")
+    if raw is None:
+        raw = payload.get("scp")
+    if isinstance(raw, str):
+        return {item.strip() for item in raw.split() if item and item.strip()}
+    if isinstance(raw, list):
+        return {str(item).strip() for item in raw if str(item).strip()}
+    return set()
+
+
+def _oauth_refresh_tokens(refresh_token: str):
+    token = str(refresh_token or "").strip()
+    if not token:
+        return None
+
+    session = curl_requests.Session()
+    if DEFAULT_PROXY:
+        session.proxies = {"http": DEFAULT_PROXY, "https": DEFAULT_PROXY}
+
+    try:
+        resp = session.post(
+            f"{OAUTH_ISSUER}/oauth/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": token,
+                "client_id": OAUTH_CLIENT_ID,
+                "scope": "openid profile email",
+            },
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+
+    if not isinstance(data, dict) or not data.get("access_token"):
+        return None
+    return data
+
+
+def _oauth_exchange_api_key_access_token(id_token: str):
+    token = str(id_token or "").strip()
+    if not token:
+        return ""
+
+    session = curl_requests.Session()
+    if DEFAULT_PROXY:
+        session.proxies = {"http": DEFAULT_PROXY, "https": DEFAULT_PROXY}
+
+    try:
+        resp = session.post(
+            f"{OAUTH_ISSUER}/oauth/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "client_id": OAUTH_CLIENT_ID,
+                "requested_token": "openai-api-key",
+                "subject_token": token,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+            },
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            return ""
+        data = resp.json()
+    except Exception:
+        return ""
+
+    return str(data.get("access_token", "") or "").strip()
 
 
 def _mask_text(value, head=2, tail=2):
@@ -268,6 +363,30 @@ def _count_token_json_files():
         return 0
 
 
+def _count_tokens_with_api_key():
+    token_dir = _resolve_project_path(TOKEN_JSON_DIR)
+    if not token_dir or not os.path.isdir(token_dir):
+        return 0
+    total = 0
+    try:
+        for name in os.listdir(token_dir):
+            if not name.lower().endswith(".json"):
+                continue
+            path = os.path.join(token_dir, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if str(data.get("api_key_access_token", "") or "").strip():
+                    total += 1
+            except Exception:
+                continue
+    except Exception:
+        return 0
+    return total
+
+
 def collect_pool_stats(output_file=None):
     output = output_file or DEFAULT_OUTPUT_FILE
     pool_total, pool_unique = _count_output_accounts(output)
@@ -275,6 +394,7 @@ def collect_pool_stats(output_file=None):
         "pool_total": pool_total,
         "pool_unique": pool_unique,
         "token_json_total": _count_token_json_files(),
+        "token_json_with_api_key": _count_tokens_with_api_key(),
         "ak_total": _count_nonempty_lines(AK_FILE),
         "rk_total": _count_nonempty_lines(RK_FILE),
     }
@@ -295,6 +415,7 @@ def print_pool_stats(run_total=None, run_success=None, run_fail=None, output_fil
     print(f"[STATS] pool_total={stats['pool_total']}")
     print(f"[STATS] pool_unique={stats['pool_unique']}")
     print(f"[STATS] token_json_total={stats['token_json_total']}")
+    print(f"[STATS] token_json_with_api_key={stats['token_json_with_api_key']}")
     print(f"[STATS] ak_total={stats['ak_total']}")
     print(f"[STATS] rk_total={stats['rk_total']}")
 
@@ -562,24 +683,59 @@ def _decode_jwt_payload(token: str):
 
 
 def _save_codex_tokens(email: str, tokens: dict):
-    access_token = tokens.get("access_token", "")
-    refresh_token = tokens.get("refresh_token", "")
-    id_token = tokens.get("id_token", "")
+    access_token = str(tokens.get("access_token", "") or "")
+    refresh_token = str(tokens.get("refresh_token", "") or "")
+    id_token = str(tokens.get("id_token", "") or "")
 
-    if access_token:
+    access_scopes = _token_scope_set(access_token)
+    api_key_access_token = ""
+    usable_token = ""
+    usable_source = ""
+
+    if "api.responses.write" in access_scopes:
+        usable_token = access_token
+        usable_source = "access_token"
+
+    if not usable_token and id_token:
+        api_key_access_token = _oauth_exchange_api_key_access_token(id_token)
+        if api_key_access_token:
+            usable_token = api_key_access_token
+            usable_source = "token_exchange"
+
+    if not usable_token and refresh_token:
+        refreshed = _oauth_refresh_tokens(refresh_token)
+        if refreshed:
+            access_token = str(refreshed.get("access_token", "") or access_token)
+            refresh_token = str(refreshed.get("refresh_token", "") or refresh_token)
+            id_token = str(refreshed.get("id_token", "") or id_token)
+            access_scopes = _token_scope_set(access_token)
+
+            if "api.responses.write" in access_scopes:
+                usable_token = access_token
+                usable_source = "refreshed_access_token"
+            elif id_token:
+                api_key_access_token = _oauth_exchange_api_key_access_token(id_token)
+                if api_key_access_token:
+                    usable_token = api_key_access_token
+                    usable_source = "refreshed_token_exchange"
+
+    if usable_token:
         with _file_lock:
             with open(AK_FILE, "a", encoding="utf-8") as f:
-                f.write(f"{access_token}\n")
+                f.write(f"{usable_token}\n")
+    else:
+        with _print_lock:
+            print(f"  [AK] skip unusable token for {_mask_email(email)} (missing api.responses.write)")
 
     if refresh_token:
         with _file_lock:
             with open(RK_FILE, "a", encoding="utf-8") as f:
                 f.write(f"{refresh_token}\n")
 
-    if not access_token:
+    if not access_token and not usable_token:
         return
 
-    payload = _decode_jwt_payload(access_token)
+    payload = _decode_jwt_payload(access_token or usable_token)
     auth_info = payload.get("https://api.openai.com/auth", {})
     account_id = auth_info.get("chatgpt_account_id", "")
 
@@ -601,6 +757,10 @@ def _save_codex_tokens(email: str, tokens: dict):
         "id_token": id_token,
         "account_id": account_id,
         "access_token": access_token,
+        "access_scope": sorted(access_scopes),
+        "api_key_access_token": api_key_access_token,
+        "usable_bearer_token": usable_token,
+        "usable_bearer_source": usable_source,
         "last_refresh": now.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
         "refresh_token": refresh_token,
     }
@@ -711,6 +871,7 @@ def _upload_token_to_codex_manager(filepath):
                 "access_token": token_data.get("access_token", ""),
                 "id_token": token_data.get("id_token", ""),
                 "refresh_token": token_data.get("refresh_token", ""),
+                "api_key_access_token": token_data.get("api_key_access_token", ""),
             },
         }
         if token_data.get("account_id"):
